@@ -2,6 +2,8 @@ import numpy as np
 import scipy.fftpack
 from scipy.ndimage import rotate, shift
 import librosa
+from skimage.color import rgb2gray
+from skimage.feature import hog, local_binary_pattern
 
 
 def mel_inv(x):
@@ -111,15 +113,73 @@ def process_audio(signal, fs, augment=False):
     return features
 
 
-def process_image(img, augment=False):
+def extract_hog(img, orientations=8, pixels_per_cell=(8, 8), cells_per_block=(2, 2)):
+    """Extracts Histogram of Oriented Gradients (HOG) features."""
+    if img.ndim == 3:
+        img = rgb2gray(img)
+
+    features = hog(
+        img,
+        orientations=orientations,
+        pixels_per_cell=pixels_per_cell,
+        cells_per_block=cells_per_block,
+        feature_vector=True,
+    )
+    return features
+
+
+def extract_lbp(img, n_points=8, radius=1, method="uniform"):
+    """Extracts Local Binary Patterns (LBP) histogram features."""
+    if img.ndim == 3:
+        img = rgb2gray(img)
+
+    # make sure image is uint8 not float
+    if img.dtype != np.uint8:
+        img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+
+    lbp = local_binary_pattern(img, n_points, radius, method)
+
+    # Calculate the histogram of the LBP codes
+    n_bins = int(lbp.max() + 1)
+    hist, _ = np.histogram(lbp.ravel(), bins=n_bins, range=(0, n_bins), density=True)
+    return hist
+
+
+def process_image(img, augment=False, feature_cfg=None):
     """
-    Complete image pipeline: Augmentation -> Flattening/Normalization
-    Returns 1D array of image features.
+    Complete image pipeline: Augmentation -> Feature Extraction
+    Returns 1D array of image features based on the config.
     """
     if augment:
         img = augment_image(img)
 
-    # Flatten the image (as baseline does) and normalize to [0, 1] for better stability
-    # especially helpful for linear classifiers and neural networks
-    features = img.ravel() / 255.0
-    return features
+    if feature_cfg is None or feature_cfg.type == "raw":
+        return img.ravel() / 255.0
+
+    features = []
+    f_type = feature_cfg.type
+
+    if "hog" in f_type:
+        h_cfg = feature_cfg.hog
+        features.append(
+            extract_hog(
+                img,
+                orientations=h_cfg.orientations,
+                pixels_per_cell=list(h_cfg.pixels_per_cell),
+                cells_per_block=list(h_cfg.cells_per_block),
+            )
+        )
+
+    if "lbp" in f_type:
+        l_cfg = feature_cfg.lbp
+        features.append(
+            extract_lbp(img, n_points=l_cfg.n_points, radius=l_cfg.radius, method=l_cfg.method)
+        )
+
+    # Combine features if both were requested
+    if features:
+        x = np.concatenate(features)
+        return x
+
+    # Fallback
+    return img.ravel() / 255.0

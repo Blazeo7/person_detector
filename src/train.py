@@ -21,8 +21,10 @@ def prepare_paired_dataset(samples: list[Sample]):
     return [v for v in paired.values() if Modality.AUDIO in v and Modality.IMAGE in v]
 
 
-def extract_features(paired_data, augment=False):
-    print(f"Extracting features (Augmentation: {augment})...")
+def extract_features(paired_data, cfg):
+    augment = cfg.training.augment
+    print(f"Extracting features (Augmentation: {augment}, Image Features: {cfg.features.image.type})...")
+
     X_audio, X_image, y, raw_samples = [], [], [], []
     for pair in paired_data:
         # Audio
@@ -31,10 +33,11 @@ def extract_features(paired_data, augment=False):
 
         # Image
         img = load_image(pair[Modality.IMAGE].path)
-        X_image.append(process_image(img, augment=augment))
+        X_image.append(process_image(img, augment=augment, feature_cfg=cfg.features.image))
 
         y.append(pair["label"])
         raw_samples.append(pair["sample_obj"])
+
     return X_audio, X_image, np.array(y), raw_samples
 
 
@@ -56,7 +59,7 @@ def main(cfg: DictConfig):
     paired_data = prepare_paired_dataset(audio_samples + image_samples)
 
     # Extract features (apply augmentation ONLY if specified in config)
-    X_audio, X_image, y, raw_samples = extract_features(paired_data, augment=cfg.training.augment)
+    X_audio, X_image, y, raw_samples = extract_features(paired_data, cfg)
     X_fusion = list(zip(X_audio, X_image))
 
     # Map config keys to actual data

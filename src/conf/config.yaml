@@ -5,6 +5,18 @@ paths:
   eval_dir: "eval_data"
   models_dir: "saved_models"
 
+features:
+  image:
+    type: "hog_lbp" # Options: 'raw', 'hog', 'lbp', 'hog_lbp'
+    hog:
+      orientations: 8
+      pixels_per_cell: [ 8, 8 ]
+      cells_per_block: [ 2, 2 ]
+    lbp:
+      radius: 1
+      n_points: 8 # Usually 8 * radius
+      method: "uniform"
+
 training:
   cv_splits: 3
   augment: False
