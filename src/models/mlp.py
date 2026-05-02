@@ -1,4 +1,6 @@
 import numpy as np
+
+from utils.logger import Logger
 from .base import BaseDetector
 
 
@@ -49,7 +51,7 @@ class MLPDetector(BaseDetector):
         self.hidden_size = hidden_size
         self.epochs = epochs
         self.learning_rate = learning_rate
-        self.verbose = verbose
+        self._logger = Logger(verbose)
 
         self.w1 = None
         self.w2 = None
@@ -64,13 +66,12 @@ class MLPDetector(BaseDetector):
         self.w1 = np.random.randn(input_dim + 1, self.hidden_size) * 0.1
         self.w2 = np.random.randn(self.hidden_size + 1) * 0.1
 
-        if self.verbose:
-            print(f"Training MLP on {len(X_mat)} samples with dimension {input_dim}...")
+        self._logger.info(f"Training MLP on {len(X_mat)} samples with dimension {input_dim}...")
 
         for epoch in range(self.epochs):
             self.w1, self.w2, loss = train_nnet(X_mat, y, self.w1, self.w2, self.learning_rate)
-            if self.verbose and (epoch + 1) % 10 == 0:
-                print(f"  Epoch {epoch+1}/{self.epochs} - Loss: {loss:.4f}")
+            if (epoch + 1) % 10 == 0:
+                self._logger.info(f"  Epoch {epoch+1}/{self.epochs} - Loss: {loss:.4f}")
 
         return self
 

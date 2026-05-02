@@ -1,5 +1,7 @@
 import numpy as np
 from scipy.special import logsumexp
+
+from utils.logger import Logger
 from .base import BaseDetector
 
 
@@ -55,7 +57,7 @@ class GMMDetector(BaseDetector):
         self.n_iter = n_iter
         self.p_target = p_target
         self.p_nontarget = 1.0 - p_target
-        self.verbose = verbose
+        self._logger = Logger(verbose)
 
         # Dictionaries to hold the trained parameters for both classes
         self.model_target = None
@@ -75,12 +77,10 @@ class GMMDetector(BaseDetector):
         train_t = np.vstack(X_t)
         train_n = np.vstack(X_n)
 
-        if self.verbose:
-            print(f"Training Target GMM on {len(train_t)} frames...")
+        self._logger.info(f"Training Target GMM on {len(train_t)} frames...")
         self.model_target = self._train_single_gmm(train_t, "Target")
 
-        if self.verbose:
-            print(f"Training Non-Target GMM on {len(train_n)} frames...")
+        self._logger.info(f"Training Non-Target GMM on {len(train_n)} frames...")
         self.model_nontarget = self._train_single_gmm(train_n, "Non-Target")
 
         return self
@@ -94,8 +94,8 @@ class GMMDetector(BaseDetector):
 
         for jj in range(self.n_iter):
             ws, mus, covs, tll = train_gmm_step(data, ws, mus, covs)
-            if self.verbose and (jj + 1) % 10 == 0:
-                print(f"  Iteration {jj+1}/{self.n_iter} - TLL ({label_name}): {tll:.2f}")
+            if (jj + 1) % 10 == 0:
+                self._logger.info(f"  Iteration {jj+1}/{self.n_iter} - TLL ({label_name}): {tll:.2f}")
 
         return {"ws": ws, "mus": mus, "covs": covs}
 

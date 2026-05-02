@@ -26,7 +26,8 @@ models:
     _target_: models.gmm.GMMDetector
     n_components: 30
     n_iter: 40
-    verbose: False
+    verbose: true
+
   image:
     _target_: models.mlp.MLPDetector
     hidden_size: 50
