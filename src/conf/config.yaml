@@ -34,6 +34,13 @@ models:
     epochs: 100
     learning_rate: 0.01
     verbose: False
+
+  # image:
+  #   _target_: models.lda.LDADetector
+  #   use_pca: True
+  #   pca_variance: 0.95
+  #   verbose: True
+
   fusion:
     _target_: models.fusion.ScoreFusionDetector
     epochs: 200
