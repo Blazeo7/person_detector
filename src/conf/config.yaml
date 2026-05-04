@@ -2,10 +2,16 @@
 paths:
   target_train: [ "data/target_train", "data/target_dev" ]
   non_target_train: [ "data/non_target_train", "data/non_target_dev" ]
-  eval_dir: "eval_data"
+  eval_dir: "eval"
   models_dir: "saved_models"
 
 features:
+  audio:
+    mfcc: true
+    n_mfcc: 21
+    deltas: true # Extracts 1st and 2nd order deltas (requires mfcc: true)
+    spectral: true # Extracts RMS, ZCR, Flatness, and Centroid
+    pitch: true # Extracts f0 globally
   image:
     type: "hog_lbp" # Options: 'raw', 'hog', 'lbp', 'hog_lbp'
     hog:
@@ -13,36 +19,48 @@ features:
       pixels_per_cell: [ 8, 8 ]
       cells_per_block: [ 2, 2 ]
     lbp:
-      radius: 1
-      n_points: 8 # Usually 8 * radius
+      radius: 2
+      n_points: 8
       method: "uniform"
 
 training:
   cv_splits: 3
-  augment: False
+  n_augmentations: 3 # 0 means no augmentation, >0 means Original + N augmented copies
 
 models:
+  # audio:
+  #   _target_: models.gmm.GMMDetector
+  #   n_components: 2
+  #   n_iter: 100
+  #   p_target: 0.135
+  #   threshold: 0.2
+  #   use_pca: true
+  #   pca_n_components: 15
+  #   covariance_type: "diag"
+  #   reg_covar: 1e-3
+  #   verbose: true
+
   audio:
-    _target_: models.gmm.GMMDetector
-    n_components: 30
-    n_iter: 40
+    _target_: models.svm.SVMDetector
+    use_pca: true
+    pca_variance: 0.95
+    C: 0.01
+    kernel: linear
+    threshold: 0.2
     verbose: true
 
   image:
-    _target_: models.mlp.MLPDetector
-    hidden_size: 50
-    epochs: 100
-    learning_rate: 0.01
-    verbose: False
-
-  # image:
-  #   _target_: models.lda.LDADetector
-  #   use_pca: True
-  #   pca_variance: 0.95
-  #   verbose: True
+    _target_: models.svm.SVMDetector
+    use_pca: true
+    pca_variance: 0.8
+    C: 0.1
+    kernel: rbf
+    threshold: 0.2
+    verbose: true
 
   fusion:
     _target_: models.fusion.ScoreFusionDetector
     epochs: 200
     learning_rate: 0.05
-    verbose: False
+    threshold: 0.2
+    verbose: true

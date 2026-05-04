@@ -1,5 +1,4 @@
 import logging
-from typing import Optional
 
 from utils.colored_formatter import ColoredFormatter
 

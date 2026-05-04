@@ -22,7 +22,7 @@ class BaseDetector(ABC):
         pass
 
     @abstractmethod
-    def predict_score(self, X: list) -> np.ndarray:
+    def predict_proba(self, X: list) -> np.ndarray:
         """
         Compute the continuous confidence score for each sample.
         Higher score = more confident that the sample belongs to the target person.
@@ -41,5 +41,5 @@ class BaseDetector(ABC):
         The assignment requires an apriori probability of 0.5, which typically
         means the decision threshold is strictly at 0.0.
         """
-        scores = self.predict_score(X)
+        scores = self.predict_proba(X)
         return (scores > 0).astype(int)

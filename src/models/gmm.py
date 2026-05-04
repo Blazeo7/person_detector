@@ -1,12 +1,18 @@
 import numpy as np
 from scipy.special import logsumexp
+from scipy.special import expit  # sigmoid for LLR → probability
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 
 from utils.logger import Logger
-from .base import BaseDetector
+from models.base import BaseDetector
+
+# ------------------------------------------------------------------ #
+# GMM math helpers (unchanged)
+# ------------------------------------------------------------------ #
 
 
 def logpdf_gauss(x, mu, cov):
-    assert mu.ndim == 1 and len(mu) == len(cov) and (cov.ndim == 1 or cov.shape[0] == cov.shape[1])
     x = np.atleast_2d(x) - mu
     if cov.ndim == 1:
         return -0.5 * (len(mu) * np.log(2 * np.pi) + np.sum(np.log(cov)) + np.sum((x**2) / cov, axis=1))
@@ -19,11 +25,13 @@ def logpdf_gauss(x, mu, cov):
 
 
 def logpdf_gmm(x, ws, mus, covs):
-    return logsumexp([np.log(w) + logpdf_gauss(x, m, c) for w, m, c in zip(ws, mus, covs)], axis=0)
+    return logsumexp(
+        [np.log(w) + logpdf_gauss(x, m, c) for w, m, c in zip(ws, mus, covs)],
+        axis=0,
+    )
 
 
 def train_gmm_step(x, ws, mus, covs):
-    """Single EM iteration for GMM training."""
     gamma = np.vstack([np.log(w) + logpdf_gauss(x, m, c) for w, m, c in zip(ws, mus, covs)])
     logevidence = logsumexp(gamma, axis=0)
     gamma = np.exp(gamma - logevidence)
@@ -31,8 +39,7 @@ def train_gmm_step(x, ws, mus, covs):
     gammasum = gamma.sum(axis=1)
     ws = gammasum / len(x)
     mus = gamma.dot(x) / gammasum[:, np.newaxis]
-
-    if covs[0].ndim == 1:  # diagonal covariance matrices
+    if covs[0].ndim == 1:
         covs = gamma.dot(x**2) / gammasum[:, np.newaxis] - mus**2
     else:
         covs = np.array(
@@ -41,81 +48,183 @@ def train_gmm_step(x, ws, mus, covs):
                 for i in range(len(ws))
             ]
         )
+
     return ws, mus, covs, tll
 
 
+# ------------------------------------------------------------------ #
+# Detector
+# ------------------------------------------------------------------ #
+
+
 class GMMDetector(BaseDetector):
-    def __init__(self, n_components=30, n_iter=40, p_target=0.5, verbose=False):
-        """
-        Args:
-            n_components: Number of Gaussian mixtures (M).
-            n_iter: Number of EM algorithm iterations.
-            p_target: Apriori probability of the target (assignment specifies 0.5).
-            verbose: If True, prints log-likelihood during training.
-        """
+    """
+    GMM-based speaker detector for audio feature vectors.
+
+    Pipeline: StandardScaler → PCA (optional) → GMM (target) vs GMM (non-target)
+    Scores via log-likelihood ratio, converted to probabilities via sigmoid.
+
+    Config yaml block expected:
+        models:
+          audio:
+            _target_: models.gmm.GMMDetector
+            n_components: 2
+            n_iter: 100
+            p_target: 0.135
+            use_pca: true
+            pca_n_components: 15
+            covariance_type: "diag"
+            reg_covar: 0.001
+            verbose: true
+    """
+
+    def __init__(
+        self,
+        n_components: int = 2,
+        n_iter: int = 100,
+        p_target: float = 0.5,
+        use_pca: bool = True,
+        pca_n_components: int = 15,
+        threshold: float = 0.5,
+        verbose: bool = False,
+        covariance_type: str = "diag",
+        reg_covar: float = 1e-3,
+    ):
         self.n_components = n_components
+        self.covariance_type = covariance_type
         self.n_iter = n_iter
         self.p_target = p_target
         self.p_nontarget = 1.0 - p_target
+        self.use_pca = use_pca
+        self.pca_n_components = pca_n_components
+        self.threshold = threshold
+        self.reg_covar = reg_covar
         self._logger = Logger(verbose)
 
-        # Dictionaries to hold the trained parameters for both classes
+        self.scaler = StandardScaler()
+        self.pca = PCA(n_components=pca_n_components, random_state=42) if use_pca else None
         self.model_target = None
         self.model_nontarget = None
 
-    def fit(self, X: list, y: np.ndarray):
+    # ------------------------------------------------------------------ #
+    # Preprocessing
+    # ------------------------------------------------------------------ #
+
+    def _preprocess_fit(self, X: np.ndarray) -> np.ndarray:
+        """Fit scaler + PCA on training data and transform."""
+        X = self.scaler.fit_transform(X)
+        if self.pca is not None:
+            X = self.pca.fit_transform(X)
+            self._logger.info(f"  PCA reduced dim to: {self.pca.n_components_}")
+        return X
+
+    def _preprocess(self, X: np.ndarray) -> np.ndarray:
+        """Apply fitted scaler + PCA."""
+        X = self.scaler.transform(X)
+        if self.pca is not None:
+            X = self.pca.transform(X)
+        return X
+
+    # ------------------------------------------------------------------ #
+    # Fit
+    # ------------------------------------------------------------------ #
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "GMMDetector":
         """
-        Trains two separate GMMs: one for target, one for non-target.
-        Audio samples are typically sequences of frames, so we stack them
-        together before running the EM algorithm.
+        X: (N, feat_dim) — one row per sample (already extracted stats from AudioProcessor)
+        y: (N,)          — binary labels
         """
-        # Separate features by class
-        X_t = [x for x, label in zip(X, y) if label == 1]
-        X_n = [x for x, label in zip(X, y) if label == 0]
+        self._logger.info(f"  Input dim: {X.shape[1]}, samples: {X.shape[0]}")
 
-        # Stack all frames vertically into a single large dataset for GMM
-        train_t = np.vstack(X_t)
-        train_n = np.vstack(X_n)
+        X = self._preprocess_fit(X)
 
-        self._logger.info(f"Training Target GMM on {len(train_t)} frames...")
-        self.model_target = self._train_single_gmm(train_t, "Target")
+        X_target = X[y == 1]
+        X_nontarget = X[y == 0]
 
-        self._logger.info(f"Training Non-Target GMM on {len(train_n)} frames...")
-        self.model_nontarget = self._train_single_gmm(train_n, "Non-Target")
+        self._logger.info(f"  Target samples: {len(X_target)}, Non-target: {len(X_nontarget)}")
+
+        self.model_target = self._train_gmm(X_target, label="Target")
+        self.model_nontarget = self._train_gmm(X_nontarget, label="Non-Target")
 
         return self
 
-    def _train_single_gmm(self, data: np.ndarray, label_name: str) -> dict:
-        """Internal helper to train a single GMM."""
+    def _train_gmm(self, data: np.ndarray, label: str) -> dict:
         M = self.n_components
-        mus = data[np.random.randint(1, len(data), M)]
-        covs = [np.var(data, axis=0)] * M
+        # Initialise means from random data points
+        idx = np.random.default_rng(42).choice(len(data), size=M, replace=False)
+        mus = data[idx].copy()
+
+        # Apply the explicit self.reg_covar floor during initialization
+        covs = [np.var(data, axis=0) + self.reg_covar] * M
         ws = np.ones(M) / M
 
-        for jj in range(self.n_iter):
+        for it in range(self.n_iter):
             ws, mus, covs, tll = train_gmm_step(data, ws, mus, covs)
-            if (jj + 1) % 10 == 0:
-                self._logger.info(f"  Iteration {jj+1}/{self.n_iter} - TLL ({label_name}): {tll:.2f}")
+
+            # Apply the explicit self.reg_covar floor after every EM step to prevent collapse
+            covs = [np.maximum(c, self.reg_covar) for c in covs]
+
+            if (it + 1) % 10 == 0:
+                self._logger.info(f"    [{label}] iter {it+1}/{self.n_iter}  TLL={tll:.2f}")
+
+        # ── GMM health check ─────────────────────────────────────────────────
+        gamma = np.vstack([np.log(w) + logpdf_gauss(data, m, c) for w, m, c in zip(ws, mus, covs)])
+        responsibilities = np.exp(gamma - logsumexp(gamma, axis=0))
+        effective_counts = responsibilities.sum(axis=1)
+
+        self._logger.info(
+            f"  [{label}] Component effective counts: " f"{np.round(effective_counts, 1).tolist()}"
+        )
+        self._logger.info(f"  [{label}] Component weights: " f"{np.round(ws, 3).tolist()}")
+        self._logger.info(
+            f"  [{label}] Mean cov norms: " f"{[round(float(np.mean(c)), 4) for c in covs]}"
+        )
 
         return {"ws": ws, "mus": mus, "covs": covs}
 
-    def predict_score(self, X: list) -> np.ndarray:
-        """
-        Calculates the log-likelihood ratio for each audio sequence.
-        """
-        scores = []
-        for x in X:
-            # Calculate log probabilities frame-by-frame
-            ll_t = logpdf_gmm(
-                x, self.model_target["ws"], self.model_target["mus"], self.model_target["covs"]
-            )
-            ll_n = logpdf_gmm(
-                x, self.model_nontarget["ws"], self.model_nontarget["mus"], self.model_nontarget["covs"]
-            )
+    # ------------------------------------------------------------------ #
+    # Inference
+    # ------------------------------------------------------------------ #
 
-            # Sum over all frames to get the total log-likelihood for the sequence,
-            # then apply Bayes' rule with apriori probabilities.
-            score = (np.sum(ll_t) + np.log(self.p_target)) - (np.sum(ll_n) + np.log(self.p_nontarget))
-            scores.append(score)
+    def _llr(self, X: np.ndarray) -> np.ndarray:
+        """Log-likelihood ratio for each sample row in X (already preprocessed)."""
+        ll_t = np.array(
+            [
+                np.sum(
+                    logpdf_gmm(
+                        x.reshape(1, -1),
+                        self.model_target["ws"],
+                        self.model_target["mus"],
+                        self.model_target["covs"],
+                    )
+                )
+                for x in X
+            ]
+        )
+        ll_n = np.array(
+            [
+                np.sum(
+                    logpdf_gmm(
+                        x.reshape(1, -1),
+                        self.model_nontarget["ws"],
+                        self.model_nontarget["mus"],
+                        self.model_nontarget["covs"],
+                    )
+                )
+                for x in X
+            ]
+        )
+        return (ll_t + np.log(self.p_target)) - (ll_n + np.log(self.p_nontarget))
 
-        return np.array(scores)
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """
+        Returns (N, 2) array of [p_nontarget, p_target],
+        consistent with sklearn convention.
+        """
+        X = self._preprocess(X)
+        llr = self._llr(X)
+        p_target = expit(llr)  # sigmoid maps LLR → probability
+        return np.column_stack([1 - p_target, p_target])
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        return (self.predict_proba(X)[:, 1] >= self.threshold).astype(int)

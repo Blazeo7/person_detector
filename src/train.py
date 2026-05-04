@@ -1,137 +1,361 @@
+import hydra
+import numpy as np
 import os
 import pickle
-import hydra
+from omegaconf import DictConfig, OmegaConf
 from hydra.utils import instantiate
-from omegaconf import DictConfig
-import numpy as np
-from collections import defaultdict
 
-from dataset import Sample, load_samples, load_audio, load_image, Modality, Label
-from features import process_audio, process_image
-from models.base import BaseDetector
+from dataset.data_loader import DataLoader
+from sklearn.metrics import (
+    DetCurveDisplay,
+    det_curve,
+    f1_score,
+    precision_recall_curve,
+    roc_auc_score,
+    confusion_matrix,
+    roc_curve,
+    auc,
+)
+from utils.logger import Logger
 from validation import session_kfold_splits
 
-
-def prepare_paired_dataset(samples: list[Sample]):
-    paired = defaultdict(dict)
-    for s in samples:
-        paired[s.name][s.modality] = s
-        paired[s.name]["label"] = 1 if s.label == Label.TARGET else 0
-        paired[s.name]["sample_obj"] = s
-    return [v for v in paired.values() if Modality.AUDIO in v and Modality.IMAGE in v]
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 
-def extract_features(paired_data, cfg):
-    augment = cfg.training.augment
-    print(f"Extracting features (Augmentation: {augment}, Image Features: {cfg.features.image.type})...")
 
-    X_audio, X_image, y, raw_samples = [], [], [], []
-    for pair in paired_data:
-        # Audio
-        fs, sig = load_audio(pair[Modality.AUDIO].path)
-        X_audio.append(process_audio(sig, fs, augment=augment))
+def train_modality(cfg: DictConfig, fold, fold_idx: int, modality: str):
+    """Instantiate, fit, and return a model for one modality on one fold."""
+    model = instantiate(cfg.models[modality])
 
-        # Image
-        img = load_image(pair[Modality.IMAGE].path)
-        X_image.append(process_image(img, augment=augment, feature_cfg=cfg.features.image))
+    if modality == "image":
+        X_train, y_train = fold.train_images, fold.train_labels
+        X_val, y_val = fold.val_images, fold.val_labels
+    else:
+        X_train, y_train = fold.train_audios, fold.train_labels
+        X_val, y_val = fold.val_audios, fold.val_labels
 
-        y.append(pair["label"])
-        raw_samples.append(pair["sample_obj"])
+    model.fit(X_train, y_train)
 
-    return X_audio, X_image, np.array(y), raw_samples
+    # ── Probability distribution diagnostic ──────────────────────────────
+    train_probs_full = model.predict_proba(X_train)
+    train_probs = train_probs_full[:, 1] if train_probs_full.ndim > 1 else train_probs_full
+
+    val_probs_full = model.predict_proba(X_val)
+    val_probs = val_probs_full[:, 1] if val_probs_full.ndim > 1 else val_probs_full
+
+    print(f"  [{modality}] Probability stats (TRAIN)")
+    print(
+        f"    target     n={( y_train==1).sum()}  "
+        f"mean={train_probs[y_train==1].mean():.3f}  "
+        f"std={train_probs[y_train==1].std():.3f}  "
+        f"min={train_probs[y_train==1].min():.3f}  "
+        f"max={train_probs[y_train==1].max():.3f}"
+    )
+    print(
+        f"    non-target n={(y_train==0).sum()}  "
+        f"mean={train_probs[y_train==0].mean():.3f}  "
+        f"std={train_probs[y_train==0].std():.3f}  "
+        f"min={train_probs[y_train==0].min():.3f}  "
+        f"max={train_probs[y_train==0].max():.3f}"
+    )
+
+    print(f"  [{modality}] Probability stats (VAL)")
+    print(
+        f"    target     n={(y_val==1).sum()}  "
+        f"mean={val_probs[y_val==1].mean():.3f}  "
+        f"std={val_probs[y_val==1].std():.3f}  "
+        f"min={val_probs[y_val==1].min():.3f}  "
+        f"max={val_probs[y_val==1].max():.3f}"
+    )
+    print(
+        f"    non-target n={(y_val==0).sum()}  "
+        f"mean={val_probs[y_val==0].mean():.3f}  "
+        f"std={val_probs[y_val==0].std():.3f}  "
+        f"min={val_probs[y_val==0].min():.3f}  "
+        f"max={val_probs[y_val==0].max():.3f}"
+    )
+
+    def _metrics(X, y, split: str) -> dict:
+        probs_full = model.predict_proba(X)
+        probs = probs_full[:, 1] if probs_full.ndim > 1 else probs_full
+        preds = (probs >= model.threshold).astype(int)  # Respects dynamic threshold
+
+        try:
+            auc_val = roc_auc_score(y, probs)
+        except ValueError:
+            auc_val = 0.0
+
+        f1 = f1_score(y, preds, zero_division=0)
+        cm = confusion_matrix(y, preds, labels=[0, 1])
+
+        return {
+            f"{split}_auc": auc_val,
+            f"{split}_f1": f1,
+            f"{split}_cm": cm,
+            f"{split}_y_true": y,
+            f"{split}_probs": probs,
+        }
+
+    metrics = {**_metrics(X_train, y_train, "train"), **_metrics(X_val, y_val, "val")}
+    return model, metrics
 
 
-@hydra.main(version_base=None, config_path="conf", config_name="config")
-def main(cfg: DictConfig):
-    orig_cwd = hydra.utils.get_original_cwd()
+def train_fusion(cfg, fold, fold_idx, model_audio, model_image):
+    # Dynamically instantiate from config
+    fusion_model = instantiate(cfg.models.fusion, model_audio=model_audio, model_image=model_image)
 
-    models_dir = os.path.join(orig_cwd, cfg.paths.models_dir)
-    os.makedirs(models_dir, exist_ok=True)
+    X_train_audio = fold.train_audios
+    X_train_image = fold.train_images
+    y_train = fold.train_labels
 
-    # 1. Load and prepare data
-    print("Loading data paths...")
-    target_dirs = [os.path.join(orig_cwd, d) for d in cfg.paths.target_train]
-    non_target_dirs = [os.path.join(orig_cwd, d) for d in cfg.paths.non_target_train]
+    X_val_audio = fold.val_audios
+    X_val_image = fold.val_images
+    y_val = fold.val_labels
 
-    audio_samples = load_samples(target_dirs, non_target_dirs, Modality.AUDIO)
-    image_samples = load_samples(target_dirs, non_target_dirs, Modality.IMAGE)
+    # Zip the features
+    X_train_fusion = list(zip(X_train_audio, X_train_image))
+    X_val_fusion = list(zip(X_val_audio, X_val_image))
 
-    paired_data = prepare_paired_dataset(audio_samples + image_samples)
+    fusion_model.fit(X_train_fusion, y_train)
 
-    # Extract features (apply augmentation ONLY if specified in config)
-    X_audio, X_image, y, raw_samples = extract_features(paired_data, cfg)
-    X_fusion = list(zip(X_audio, X_image))
+    # Evaluate (Train)
+    train_probs_full = fusion_model.predict_proba(X_train_fusion)
+    train_probs_1d = train_probs_full[:, 1] if train_probs_full.ndim > 1 else train_probs_full
+    train_preds = fusion_model.predict(X_train_fusion)
 
-    # Map config keys to actual data
-    data_map = {"audio": X_audio, "image": X_image, "fusion": X_fusion}
+    try:
+        train_auc = roc_auc_score(y_train, train_probs_1d)
+    except ValueError:
+        train_auc = 0.0
 
-    # Cross-Validation Loop
-    if cfg.training.cv_splits > 1:
-        print(f"\n--- Running {cfg.training.cv_splits}-Fold Session-Aware Cross Validation ---")
+    train_f1 = f1_score(y_train, train_preds, zero_division=0)
+    train_cm = confusion_matrix(y_train, train_preds, labels=[0, 1])
 
-        for fold, (train_idx, val_idx) in enumerate(
-            session_kfold_splits(raw_samples, n_splits=cfg.training.cv_splits)
-        ):
-            print(f"\nFold {fold + 1}")
-            fold_models = {}
+    # Evaluate (Validation)
+    val_probs_full = fusion_model.predict_proba(X_val_fusion)
+    val_probs_1d = val_probs_full[:, 1] if val_probs_full.ndim > 1 else val_probs_full
+    val_preds = fusion_model.predict(X_val_fusion)
 
-            # Train Base Models (Audio, Image)
-            for mod_key in ["audio", "image"]:
-                if mod_key in cfg.models:
-                    model: BaseDetector = instantiate(cfg.models[mod_key])
-                    X_train = [data_map[mod_key][i] for i in train_idx]
-                    X_val = [data_map[mod_key][i] for i in val_idx]
+    try:
+        val_auc = roc_auc_score(y_val, val_probs_1d)
+    except ValueError:
+        val_auc = 0.0
 
-                    model.fit(X_train, y[train_idx])
-                    acc = np.mean(model.predict(X_val) == y[val_idx])
-                    print(f"  {mod_key.capitalize()} Val Accuracy: {acc:.4f}")
-                    fold_models[mod_key] = model
+    val_f1 = f1_score(y_val, val_preds, zero_division=0)
+    val_cm = confusion_matrix(y_val, val_preds, labels=[0, 1])
 
-            # Train Fusion Model (Requires trained base models)
-            if "fusion" in cfg.models and "audio" in fold_models and "image" in fold_models:
-                # Hydra cleverly passes the already instantiated fold_models as kwargs
-                fusion_model = instantiate(
-                    cfg.models.fusion, model_audio=fold_models["audio"], model_image=fold_models["image"]
-                )
-                X_train_f = [data_map["fusion"][i] for i in train_idx]
-                X_val_f = [data_map["fusion"][i] for i in val_idx]
+    metrics = {
+        "train_auc": train_auc,
+        "train_f1": train_f1,
+        "train_cm": train_cm,
+        "val_auc": val_auc,
+        "val_f1": val_f1,
+        "val_cm": val_cm,
+        "val_y_true": y_val,
+        "val_probs": val_probs_1d,
+    }
+    return fusion_model, metrics
 
-                fusion_model.fit(X_train_f, y[train_idx])
-                acc = np.mean(fusion_model.predict(X_val_f) == y[val_idx])
-                print(f"  Fusion Val Accuracy: {acc:.4f}")
 
-    # Final Training on ALL Data
-    print("\n--- Training Final Models ---")
+@hydra.main(config_path="conf", config_name="config", version_base=None)
+def main(cfg: DictConfig) -> None:
+    print(OmegaConf.to_yaml(cfg))
+
+    # ------------------------------------------------------------------ #
+    # Data loading
+    # ------------------------------------------------------------------ #
+    loader = DataLoader()
+    loader.load_data(
+        target_dirs=list(cfg.paths.target_train),
+        non_target_dirs=list(cfg.paths.non_target_train),
+    )
+    print(
+        f"Loaded {len(loader.samples)} samples "
+        f"({sum(s.label for s in loader.samples)} target, "
+        f"{sum(1 - s.label for s in loader.samples)} non-target)"
+    )
+
+    # ------------------------------------------------------------------ #
+    # Cross-validation
+    # ------------------------------------------------------------------ #
+    fold_metrics = {"image": [], "audio": [], "fusion": []}
+    best_models = {"image": None, "audio": None, "fusion": None}
+    best_val_acc = {"image": 0.0, "audio": 0.0, "fusion": 0.0}
+
+    saved_models_dir = cfg.paths.models_dir
+    os.makedirs(saved_models_dir, exist_ok=True)
+
+    for fold_i, fold in enumerate(
+        session_kfold_splits(
+            loader,
+            n_splits=cfg.training.cv_splits,
+            n_augmentations=cfg.training.n_augmentations,
+            feature_cfg=cfg.features.image,
+        )
+    ):
+        print(f"Fold {fold_i}")
+
+        fold_trained_models = {}
+        for modality in ("image", "audio"):
+            model, metrics = train_modality(cfg, fold, fold_i, modality)
+            fold_trained_models[modality] = model
+            fold_metrics[modality].append(metrics)
+            Logger(True).warning(
+                f"  [{modality}] "
+                f"train_auc={metrics['train_auc']:.4f}  train_f1={metrics['train_f1']:.4f} | "
+                f"val_auc={metrics['val_auc']:.4f}    val_f1={metrics['val_f1']:.4f}"
+            )
+
+            if metrics["val_auc"] > best_val_acc[modality]:
+                best_val_acc[modality] = metrics["val_auc"]
+                best_models[modality] = model
+
+        model_fusion, fusion_metrics = train_fusion(
+            cfg, fold, fold_i, fold_trained_models["audio"], fold_trained_models["image"]
+        )
+        fold_metrics["fusion"].append(fusion_metrics)
+        print(
+            f"  [fusion] "
+            f"train_auc={fusion_metrics['train_auc']:.4f}  train_f1={fusion_metrics['train_f1']:.4f} | "
+            f"val_auc={fusion_metrics['val_auc']:.4f}    val_f1={fusion_metrics['val_f1']:.4f}"
+        )
+
+        if fusion_metrics["val_auc"] > best_val_acc["fusion"]:
+            best_val_acc["fusion"] = fusion_metrics["val_auc"]
+            best_models["fusion"] = model_fusion
+        # ---------------------------------
+
+    print("\n══ CV Summary ══")
+
+    # Setup Figures ---
+    fig_cm, axes_cm = plt.subplots(1, 3, figsize=(16, 5))
+    fig_cm.suptitle("Average Validation Confusion Matrices (Row-Normalized %)", fontsize=16)
+
+    # Setup for DET Curve ---
+    fig_det, ax_det = plt.subplots(figsize=(8, 8))
+    colors = {"image": "blue", "audio": "orange", "fusion": "green"}
+
+    for i, modality in enumerate(("image", "audio", "fusion")):
+        print(f"\n  [{modality.upper()}]")
+
+        # Metrics Printout
+        for metric in ("auc", "f1"):
+            vals = [m[f"val_{metric}"] for m in fold_metrics[modality]]
+            print(
+                f"    val_{metric}  mean={np.mean(vals):.4f}  std={np.std(vals):.4f}  best={np.max(vals):.4f}"
+            )
+
+        # Normalized Confusion Matrix
+        val_cms = [m["val_cm"] for m in fold_metrics[modality]]
+        avg_cm = np.mean(val_cms, axis=0)
+
+        # Normalize by rows (true labels) to get percentages
+        avg_cm_norm = avg_cm.astype("float") / avg_cm.sum(axis=1)[:, np.newaxis]
+
+        sns.heatmap(
+            avg_cm_norm,
+            annot=True,
+            fmt=".1%",
+            cmap="Blues",
+            ax=axes_cm[i],
+            cbar=False,
+            annot_kws={"size": 14},
+            vmin=0.0,
+            vmax=1.0,
+        )
+        axes_cm[i].set_title(f"{modality.capitalize()} Model")
+        axes_cm[i].set_xlabel("Predicted Label")
+        axes_cm[i].set_ylabel("True Label")
+
+        # Pooled DET Curve
+        # Concatenate true labels and probs across all folds to create one smooth, high-res curve
+        all_y_true = np.concatenate([m["val_y_true"] for m in fold_metrics[modality]])
+        all_probs = np.concatenate([m["val_probs"] for m in fold_metrics[modality]])
+
+        # Calculate FPR and FNR
+        fpr, fnr, _ = det_curve(all_y_true, all_probs)
+
+        # Use sklearn's built-in display to automatically apply the normal-deviate axis scaling
+        display = DetCurveDisplay(fpr=fpr, fnr=fnr, estimator_name=modality.capitalize())
+        display.plot(ax=ax_det, color=colors[modality], linewidth=2.5)
+
+    # Finalize CM Plot
+    fig_cm.tight_layout()
+
+    # Finalize DET Plot
+    ax_det.set_title(
+        "Detection Error Tradeoff (DET) Curve\n(Pooled across Validation Folds)", fontsize=14
+    )
+    # Add a fine grid to make reading the logarithmic-style scale easier
+    ax_det.grid(alpha=0.4, which="both", linestyle="--")
+    ax_det.legend(loc="upper right", fontsize=12)
+
+    plt.show()
+
+    # ------------------------------------------------------------------ #
+    # Final Model Training (100% of Data)
+    # ------------------------------------------------------------------ #
+    print("\n══ Training Final Models on 100% of Data ══")
+
+    def get_optimal_threshold(y_true, y_probs):
+        precisions, recalls, pr_thresholds = precision_recall_curve(y_true, y_probs)
+        f1_scores = np.divide(
+            2 * (precisions * recalls),
+            (precisions + recalls),
+            out=np.zeros_like(precisions),
+            where=(precisions + recalls) != 0,
+        )
+        best_idx = np.argmax(f1_scores)
+        return pr_thresholds[best_idx] if best_idx < len(pr_thresholds) else 0.5
+
+    X_all_images = np.concatenate((fold.train_images, fold.val_images), axis=0)
+    X_all_audios = np.concatenate((fold.train_audios, fold.val_audios), axis=0)
+    y_all = np.concatenate((fold.train_labels, fold.val_labels), axis=0)
+
     final_models = {}
 
-    for mod_key in ["audio", "image"]:
-        if mod_key in cfg.models:
-            print(f"Training {mod_key} model on all data...")
-            model = instantiate(cfg.models[mod_key], verbose=True)
-            model.fit(data_map[mod_key], y)
-            final_models[mod_key] = model
+    # Train Final Base Models
+    for modality in ["audio", "image"]:
+        print(f"  Training Final {modality.capitalize()} Model...")
+        model = instantiate(cfg.models[modality])
+        X_all = X_all_audios if modality == "audio" else X_all_images
 
-            # Save base model
-            save_path = os.path.join(models_dir, f"{mod_key}_model.pkl")
-            with open(save_path, "wb") as f:
-                pickle.dump(model, f)
+        model.fit(X_all, y_all)
 
-    if "fusion" in cfg.models and "audio" in final_models and "image" in final_models:
-        print("Training fusion model on all data...")
-        fusion_model = instantiate(
-            cfg.models.fusion,
-            model_audio=final_models["audio"],
-            model_image=final_models["image"],
-            verbose=True,
-        )
-        fusion_model.fit(data_map["fusion"], y)
+        probs_full = model.predict_proba(X_all)
+        probs_1d = probs_full[:, 1] if probs_full.ndim > 1 else probs_full
 
-        # Save fusion model
-        save_path = os.path.join(models_dir, "fusion_model.pkl")
-        with open(save_path, "wb") as f:
-            pickle.dump(fusion_model, f)
+        best_thr = get_optimal_threshold(y_all, probs_1d)
+        model.threshold = float(best_thr)
+        print(f"    -> Best Threshold Found: {best_thr:.4f}")
 
-    print(f"\nTraining complete! Models saved to {models_dir}")
+        final_models[modality] = model
+
+    # Train Final Fusion Model
+    print("  Training Final Fusion Model...")
+    fusion_model = instantiate(
+        cfg.models.fusion, model_audio=final_models["audio"], model_image=final_models["image"]
+    )
+    X_all_fusion = list(zip(X_all_audios, X_all_images))
+
+    fusion_model.fit(X_all_fusion, y_all)
+
+    fusion_probs_full = fusion_model.predict_proba(X_all_fusion)
+    fusion_probs_1d = fusion_probs_full[:, 1] if fusion_probs_full.ndim > 1 else fusion_probs_full
+
+    best_fusion_thr = get_optimal_threshold(y_all, fusion_probs_1d)
+    fusion_model.threshold = float(best_fusion_thr)
+    print(f"    -> Best Fusion Threshold Found: {best_fusion_thr:.4f}")
+
+    final_models["fusion"] = fusion_model
+
+    # Save Final Models
+    for modality, model in final_models.items():
+        path = os.path.join(saved_models_dir, f"hope_{modality}.pkl")
+        with open(path, "wb") as f:
+            pickle.dump(model, f)
+        print(f"  Saved final deployed {modality} model → {path}")
 
 
 if __name__ == "__main__":

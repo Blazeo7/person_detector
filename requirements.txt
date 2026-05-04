@@ -3,3 +3,4 @@ matplotlib
 librosa
 hydra-core
 scikit-image
+seaborn
