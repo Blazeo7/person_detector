@@ -1,3 +1,18 @@
+# Person detection
+
+A small end-to-end person detection project trained from scratch on a compact dataset. It includes three separate models:
+
+- `speech` model: predicts from audio input
+- `face` model: predicts from face images
+- `combined` model: fuses both audio and face data
+
+### Sample result:
+![](doc/eval.png)
+
+
+### Networks architecture:
+![](doc/bimodal_pipeline.svg)
+
 ## Install
 ```bash
 python3.12 -m venv env
